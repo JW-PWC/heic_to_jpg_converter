@@ -751,8 +751,8 @@ footer p { font-size: 0.82rem; color: var(--muted); }
   <p>Made with ❤️ · No ads, no tracking, no nonsense</p>
 </footer>
 
-<!-- heic2any lib -->
-<script src="https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js"></script>
+<!-- libheif-js: WebAssembly-based HEIC decoder, handles ICC color profiles -->
+<script src="https://cdn.jsdelivr.net/npm/libheif-js@1.19.8/libheif-wasm/libheif-bundle.js"></script>
 
 <script>
 const dropZone = document.getElementById('dropZone');
@@ -766,6 +766,74 @@ const resultGrid = document.getElementById('resultGrid');
 
 let selectedFiles = [];
 let convertedBlobs = [];
+
+// libheif-bundle.js exposes `libheif` as an Emscripten factory function.
+// You must CALL it (libheif({...})) to create a module instance, then wait
+// for onRuntimeInitialized before HeifDecoder is available.
+let _libheifReady = null;
+function getLibheif() {
+  if (!_libheifReady) {
+    _libheifReady = new Promise((resolve, reject) => {
+      try {
+        const instance = libheif({
+          onRuntimeInitialized() {
+            resolve(instance);
+          }
+        });
+        // Newer Emscripten builds also expose a .ready Promise — handle both
+        if (instance && typeof instance.ready === 'object' && typeof instance.ready.then === 'function') {
+          instance.ready.then(() => resolve(instance)).catch(reject);
+        }
+      } catch (e) {
+        reject(e);
+      }
+    });
+  }
+  return _libheifReady;
+}
+
+// Convert a single HEIC File → JPEG Blob via libheif + canvas
+async function convertHeicToJpegBlob(file) {
+  const lh = await getLibheif();
+  const decoder = new lh.HeifDecoder();
+
+  const arrayBuffer = await file.arrayBuffer();
+  const images = decoder.decode(new Uint8Array(arrayBuffer));
+
+  if (!images || images.length === 0) {
+    throw new Error('No images found in HEIC file');
+  }
+
+  const image = images[0];
+  const width  = image.get_width();
+  const height = image.get_height();
+
+  // display() hands back raw RGBA pixels; it handles embedded ICC profiles internally
+  const pixelData = await new Promise((resolve, reject) => {
+    image.display(
+      { data: new Uint8ClampedArray(4 * width * height), width, height },
+      (result) => {
+        if (!result) reject(new Error('libheif display() failed — image may be corrupt'));
+        else resolve(result);
+      }
+    );
+  });
+
+  const canvas = document.createElement('canvas');
+  canvas.width  = width;
+  canvas.height = height;
+  canvas.getContext('2d').putImageData(
+    new ImageData(pixelData.data, width, height), 0, 0
+  );
+
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => blob ? resolve(blob) : reject(new Error('canvas.toBlob() returned null')),
+      'image/jpeg',
+      0.92
+    );
+  });
+}
 
 // Drag events
 dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
@@ -865,8 +933,7 @@ async function convertAll() {
     progEl.style.width = '40%';
 
     try {
-      const blob = await heic2any({ blob: file, toType: 'image/jpeg', quality: 0.92 });
-      const outputBlob = Array.isArray(blob) ? blob[0] : blob;
+      const outputBlob = await convertHeicToJpegBlob(file);
       const jpgName = file.name.replace(/\.heic$/i, '').replace(/\.heif$/i, '') + '.jpg';
       const url = URL.createObjectURL(outputBlob);
 
